@@ -1,29 +1,117 @@
 'use client'
 
-import { useState, useMemo } from 'react'
-import * as XLSX from 'xlsx'
+import { useMemo, useState } from 'react'
 
+type Action = 'send' | 'pay' | 'cancel'
 type Row = {
   id: number
-  action?: 'send' | 'pay' | 'cancel'
+  action?: Action
   reason?: string
-  send_mail?: number | string
-  // pay fields
+  send_mail?: number
   paid_at?: string
-  value?: number | string
-  wallet_id?: number | string
-  payment_form?: number | string
-  discount?: number | string
+  value?: number
+  wallet_id?: number
+  payment_form?: number
+  discount?: number
 }
 
-type Result = {
-  id: number
-  action: 'send'|'pay'|'cancel'
-  ok: boolean
-  message: string
-}
-
+type Result = { id: number; action: Action; ok: boolean; message: string }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+// ---- helpers ----------------------------------------------------
+
+function normalizeHeader(s: string) {
+  return s?.toString().trim().toLowerCase().replace(/\s+/g, '_')
+}
+
+function parseCSV(text: string): Row[] {
+  // parser simples (bom p/ planilhas exportadas)
+  const lines = text.split(/\r?\n/).filter(l => l.trim() !== '')
+  if (lines.length === 0) return []
+  const headers = lines[0].split(',').map(normalizeHeader)
+  const rows: Row[] = []
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(',')
+    const obj: any = {}
+    headers.forEach((h, idx) => (obj[h] = parts[idx]))
+    // coersões
+    if (obj.id != null) obj.id = Number(obj.id)
+    ;['value','wallet_id','payment_form','discount','send_mail'].forEach(k => {
+      if (obj[k] != null && obj[k] !== '') obj[k] = Number(obj[k])
+    })
+    if (obj.action) {
+      const a = String(obj.action).toLowerCase()
+      obj.action = a === 'emitir' || a === 'send' ? 'send'
+        : a === 'liquidar' || a === 'pay' ? 'pay'
+        : 'cancel'
+    }
+    rows.push(obj as Row)
+  }
+  return rows.filter(r => !!r.id)
+}
+
+async function parseFile(file: File): Promise<Row[]> {
+  const ext = file.name.toLowerCase().split('.').pop()
+  if (ext === 'csv') {
+    const text = await file.text()
+    return parseCSV(text)
+  }
+  // XLSX dinamicamente (só no cliente)
+  const { read, utils } = await import('xlsx')
+  const data = new Uint8Array(await file.arrayBuffer())
+  const wb = read(data, { type: 'array' })
+  const ws = wb.Sheets[wb.SheetNames[0]]
+  const raw = utils.sheet_to_json<Record<string, unknown>>(ws, { raw: false })
+  const out: Row[] = raw.map((r) => {
+    const obj: any = {}
+    Object.keys(r).forEach((k) => (obj[normalizeHeader(k)] = (r as any)[k]))
+    if (obj.id != null) obj.id = Number(obj.id)
+    ;['value','wallet_id','payment_form','discount','send_mail'].forEach(k => {
+      if (obj[k] != null && obj[k] !== '') obj[k] = Number(obj[k])
+    })
+    if (obj.action) {
+      const a = String(obj.action).toLowerCase()
+      obj.action = a === 'emitir' || a === 'send' ? 'send'
+        : a === 'liquidar' || a === 'pay' ? 'pay'
+        : 'cancel'
+    }
+    return obj as Row
+  })
+  return out.filter(r => !!r.id)
+}
+
+async function callAPI(action: Action, payload: unknown) {
+  const path =
+    action === 'send' ? '/api/invoices/send'
+    : action === 'pay' ? '/api/invoices/pay'
+    : '/api/invoices/cancel'
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
+  }
+  return data
+}
+
+function validateRowFor(action: Action, r: Row) {
+  if (!r.id) return 'id ausente'
+  if (action === 'pay') {
+    if (!r.paid_at) return 'paid_at ausente (YYYY-MM-DD)'
+    if (r.value == null) return 'value ausente'
+    if (r.wallet_id == null) return 'wallet_id ausente'
+    if (r.payment_form == null) return 'payment_form ausente'
+  }
+  if (action === 'cancel') {
+    if (!r.reason) return 'reason ausente'
+  }
+  return null
+}
+
+// ---- page component --------------------------------------------
 
 export default function InvoicesBatchPage() {
   const [rows, setRows] = useState<Row[]>([])
@@ -31,130 +119,53 @@ export default function InvoicesBatchPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  function normalizeHeader(s: string) {
-    return s?.toString().trim().toLowerCase().replace(/\s+/g, '_')
+  async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    if (!f) return
+    setError(null); setResults([])
+    try {
+      const parsed = await parseFile(f)
+      setRows(parsed)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setError(`Falha ao ler arquivo: ${msg}`)
+    }
   }
 
-  function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setError(null)
-    setResults([])
-    const reader = new FileReader()
-    reader.onload = () => {
-      try {
-        const data = new Uint8Array(reader.result as ArrayBuffer)
-        const wb = XLSX.read(data, { type: 'array' })
-        const ws = wb.Sheets[wb.SheetNames[0]]
-        // lê linhas como objetos
-        const raw = XLSX.utils.sheet_to_json(ws, { raw: false })
-        // normaliza headers -> lower + underscore
-        const norm: Row[] = (raw as any[]).map((r) => {
-          const obj: any = {}
-          Object.keys(r).forEach((k) => (obj[normalizeHeader(k)] = r[k]))
-          // coersões básicas
-          if (obj.id != null) obj.id = Number(obj.id)
-          if (obj.value != null) obj.value = Number(obj.value)
-          if (obj.wallet_id != null) obj.wallet_id = Number(obj.wallet_id)
-          if (obj.payment_form != null) obj.payment_form = Number(obj.payment_form)
-          if (obj.discount != null) obj.discount = Number(obj.discount)
-          if (obj.send_mail != null) obj.send_mail = Number(obj.send_mail)
-          if (obj.action) {
-            const a = String(obj.action).toLowerCase()
-            if (a === 'emitir' || a === 'send') obj.action = 'send'
-            else if (a === 'liquidar' || a === 'pay') obj.action = 'pay'
-            else if (a === 'cancelar' || a === 'cancel') obj.action = 'cancel'
-          }
-          return obj as Row
-        })
-        setRows(norm.filter(r => !!r.id))
-      } catch (err: any) {
-        setError(`Falha ao ler planilha: ${err.message || err}`)
-      }
-    }
-    reader.readAsArrayBuffer(file)
-  }
-
-  async function callAPI(action: 'send'|'pay'|'cancel', payload: any) {
-    const path = action === 'send' ? '/api/invoices/send'
-               : action === 'pay'  ? '/api/invoices/pay'
-               :                     '/api/invoices/cancel'
-    const res = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify(payload)
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || data.ok === false) {
-      throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
-    }
-    return data
-  }
-
-  function validateRowFor(action: 'send'|'pay'|'cancel', r: Row) {
-    if (!r.id) return 'id ausente'
-    if (action === 'pay') {
-      if (!r.paid_at) return 'paid_at ausente (YYYY-MM-DD)'
-      if (r.value == null) return 'value ausente'
-      if (r.wallet_id == null) return 'wallet_id ausente'
-      if (r.payment_form == null) return 'payment_form ausente'
-      // discount é opcional
-    }
-    if (action === 'cancel') {
-      if (!r.reason) return 'reason ausente'
-      // send_mail opcional
-    }
-    return null
-  }
-
-  async function runBatch(action?: 'send'|'pay'|'cancel') {
-    if (rows.length === 0) {
-      setError('Nenhuma linha carregada.')
-      return
-    }
+  async function runBatch(action?: Action) {
+    if (rows.length === 0) { setError('Nenhuma linha carregada.'); return }
     setBusy(true); setError(null); setResults([])
     const out: Result[] = []
 
-    // determina quais linhas rodar
-    const batch = action
-      ? rows.map(r => ({ ...r, action })) // aplica a mesma ação a todas
-      : rows.filter(r => r.action)        // usa a coluna 'action' da planilha
-
+    const batch = action ? rows.map(r => ({ ...r, action })) : rows.filter(r => r.action)
     if (batch.length === 0) {
       setBusy(false)
-      setError(action
-        ? 'Nenhuma linha válida.'
-        : 'Nenhuma linha com coluna "action" (send/pay/cancel).')
+      setError(action ? 'Nenhuma linha válida.' : 'Adicione coluna "action" (send/pay/cancel) ou use os botões de ação.')
       return
     }
 
-    for (let i = 0; i < batch.length; i++) {
-      const r = batch[i]
-      const act = (r.action || action) as 'send'|'pay'|'cancel'
+    for (const r of batch) {
+      const act = (r.action || action) as Action
       const inval = validateRowFor(act, r)
       if (inval) {
         out.push({ id: r.id, action: act, ok: false, message: inval })
         setResults([...out]); continue
       }
-
       try {
         const payload =
           act === 'send' ? { id: r.id } :
           act === 'cancel' ? { id: r.id, reason: r.reason, send_mail: r.send_mail ?? 0 } :
           { id: r.id, paid_at: r.paid_at, value: r.value, wallet_id: r.wallet_id,
             payment_form: r.payment_form, discount: r.discount ?? 0 }
-
         await callAPI(act, payload)
         out.push({ id: r.id, action: act, ok: true, message: 'OK' })
-      } catch (e:any) {
-        out.push({ id: r.id, action: act, ok: false, message: e.message })
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        out.push({ id: r.id, action: act, ok: false, message: msg })
       }
       setResults([...out])
-
-      // respeita ~60 req/min da API Siimp
-      await sleep(1100)
+      await sleep(1100) // ~60 req/min
     }
-
     setBusy(false)
   }
 
@@ -162,53 +173,29 @@ export default function InvoicesBatchPage() {
 
   return (
     <main className="p-6 space-y-6">
-      <h1 className="text-2xl font-bold">Lotes por Excel</h1>
+      <h1 className="text-2xl font-bold">Lotes por Excel / CSV</h1>
 
       <div className="space-y-2">
-        <input
-          type="file"
-          accept=".xlsx,.xls,.csv"
-          onChange={handleFile}
-          className="block"
-        />
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} className="block" />
         <p className="text-sm text-gray-600">
-          Colunas suportadas: <code>id</code> (obrigatória),
-          <code> action</code> (send/pay/cancel, opcional),
-          <code> reason</code>, <code> send_mail</code>,
-          <code> paid_at</code>, <code> value</code>, <code> wallet_id</code>,
-          <code> payment_form</code>, <code> discount</code>.
+          Colunas: <code>id</code> (obrigatório). Para <b>cancel</b>: <code>reason</code>, <code>send_mail</code>.
+          Para <b>pay</b>: <code>paid_at</code>, <code>value</code>, <code>wallet_id</code>, <code>payment_form</code>, <code>discount</code>.
+          Opcional: <code>action</code> (<code>send</code>/<code>pay</code>/<code>cancel</code>).
         </p>
       </div>
 
       <div className="flex gap-2 flex-wrap">
-        <button
-          disabled={busy || rows.length===0}
-          onClick={() => runBatch('send')}
-          className="px-3 py-2 rounded bg-blue-600 text-white disabled:opacity-50"
-        >Emitir (todas as linhas)</button>
-
-        <button
-          disabled={busy || rows.length===0}
-          onClick={() => runBatch('pay')}
-          className="px-3 py-2 rounded bg-green-600 text-white disabled:opacity-50"
-        >Liquidar (todas as linhas)</button>
-
-        <button
-          disabled={busy || rows.length===0}
-          onClick={() => runBatch('cancel')}
-          className="px-3 py-2 rounded bg-red-600 text-white disabled:opacity-50"
-        >Cancelar (todas as linhas)</button>
-
-        <button
-          disabled={busy || rows.length===0}
-          onClick={() => runBatch(undefined)}
-          className="px-3 py-2 rounded bg-gray-700 text-white disabled:opacity-50"
-        >Usar coluna "action" da planilha</button>
+        <button disabled={busy || rows.length===0} onClick={() => runBatch('send')}
+          className="px-3 py-2 rounded bg-blue-600 text-white disabled:opacity-50">Emitir (todas)</button>
+        <button disabled={busy || rows.length===0} onClick={() => runBatch('pay')}
+          className="px-3 py-2 rounded bg-green-600 text-white disabled:opacity-50">Liquidar (todas)</button>
+        <button disabled={busy || rows.length===0} onClick={() => runBatch('cancel')}
+          className="px-3 py-2 rounded bg-red-600 text-white disabled:opacity-50">Cancelar (todas)</button>
+        <button disabled={busy || rows.length===0} onClick={() => runBatch(undefined)}
+          className="px-3 py-2 rounded bg-gray-700 text-white disabled:opacity-50">{'Usar coluna "action"'}</button>
       </div>
 
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-800 px-3 py-2 rounded">{error}</div>
-      )}
+      {error && <div className="bg-red-50 border border-red-200 text-red-800 px-3 py-2 rounded">{error}</div>}
 
       <section className="space-y-2">
         <h2 className="font-semibold">Prévia (até 10 linhas)</h2>
