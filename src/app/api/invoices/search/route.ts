@@ -8,7 +8,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const out = await siimp<any>('/invoices/search', { method:'GET', query })
-    return NextResponse.json({ ok:true, ...out }) // preserva data/success/total
+    return NextResponse.json({ ok:true, data: out })
   } catch (e:any) {
     return NextResponse.json({ ok:false, error: e.message }, { status:400 })
   }

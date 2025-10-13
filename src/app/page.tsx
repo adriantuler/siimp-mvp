@@ -1,5 +1,7 @@
 'use client'
 import { useEffect, useMemo, useState } from 'react'
+import Link from 'next/link'
+
 
 type Invoice = {
   id: number
@@ -66,6 +68,14 @@ export default function InvoicesPage() {
 
   return (
     <main className="p-6 space-y-6">
+      <nav className="mb-4">
+        <Link
+          href="/invoices/batch"
+          className="inline-block px-3 py-2 rounded bg-purple-600 text-white hover:opacity-90"
+        >
+          Processar em lote (Excel/CSV)
+        </Link>
+      </nav>
       <header className="flex items-end gap-3 flex-wrap">
         <h1 className="text-2xl font-bold">Faturas</h1>
 
