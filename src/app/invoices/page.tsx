@@ -55,7 +55,7 @@ export default function InvoicesPage() {
       if (numFrom) qs.set('number_from', numFrom)
       if (numTo) qs.set('number_to', numTo)
 
-      const res = await fetch(`/api/invoices/search?${qs.toString()}`, { cache: 'no-store' })
+      const res = await fetch(`/api/invoices/list?${qs.toString()}`, { cache: 'no-store' })
       const json: unknown = await res.json().catch(() => ({}))
 
       if (!res.ok || (isObj(json) && json.ok === false)) {
