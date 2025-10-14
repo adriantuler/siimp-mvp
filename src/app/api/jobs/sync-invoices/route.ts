@@ -3,8 +3,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { ensureSchema, upsertMany, InvoiceRow } from '@/lib/invoices-store'
 
 export const runtime = 'nodejs'
+const DEFAULT_PAGE_SIZE = 40  // Siimp devolve 40 por página
 
-// Normaliza o payload do /api/invoices/search em InvoiceRow
 function normalizeRows(list: any[]): InvoiceRow[] {
   return list.map((r) => ({
     id: Number(r.id),
@@ -27,14 +27,13 @@ export async function GET(req: NextRequest) {
   try {
     const sp = new URLSearchParams(req.nextUrl.searchParams)
 
-    // defaults iguais ao front
+    // mesmos defaults do front
     if (!sp.has('status')) sp.set('status', '0')
     if (!sp.has('number_from')) sp.set('number_from', '1')
     if (!sp.has('number_to')) sp.set('number_to', '1000')
 
-    // paginação: usa ?page e ?limit se vierem, senão define
-    const limit = Math.max(1, parseInt(sp.get('limit') ?? '200', 10)) // pode ajustar
-    sp.set('limit', String(limit))
+    // força um limit "alto" (mesmo que o upstream ignore)
+    sp.set('limit', '200')
 
     const origin = req.nextUrl.origin
     let page = Math.max(1, parseInt(sp.get('page') ?? '1', 10))
@@ -54,12 +53,13 @@ export async function GET(req: NextRequest) {
       all.push(...items)
       totalFetched += items.length
 
-      // critério de parada: última página (< limit) ou vazio
-      if (items.length < limit) break
+      // critério de parada robusto:
+      // - 0 itens → acabou
+      // - < 40 itens → última página parcial → acabou
+      if (items.length === 0 || items.length < DEFAULT_PAGE_SIZE) break
 
-      // safe-guard para não laçar infinito
-      if (page > 5000) break
       page += 1
+      if (page > 5000) break // proteção
     }
 
     await ensureSchema()
@@ -71,7 +71,7 @@ export async function GET(req: NextRequest) {
       ok: true,
       route: 'jobs/sync-invoices',
       fetched_pages: page,
-      page_size: limit,
+      page_size_assumed: DEFAULT_PAGE_SIZE,
       fetched_total: totalFetched,
       wrote: all.length,
       sample_ids: all.slice(0, 5).map(r => r.id),
