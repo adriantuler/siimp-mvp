@@ -22,11 +22,22 @@ const STATUS_MAP: Record<number, string> = {
   3: 'Emitida',
 }
 
+function isObj(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null
+}
+
+function toArray<T>(x: unknown): T[] {
+  if (Array.isArray(x)) return x as T[]
+  if (isObj(x)) return [x as T]
+  return []
+}
+
 export default function InvoicesPage() {
   const [rows, setRows] = useState<Invoice[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // filtros simples
   const [status, setStatus] = useState<string>('0')
   const [numFrom, setNumFrom] = useState<string>('1')
   const [numTo, setNumTo] = useState<string>('1000')
@@ -41,19 +52,27 @@ export default function InvoicesPage() {
       if (numTo) qs.set('number_to', numTo)
 
       const res = await fetch(`/api/invoices/search?${qs.toString()}`, { cache: 'no-store' })
-      const json = await res.json().catch(() => ({}))
-      if (!res.ok || (json && json.ok === false)) {
-        throw new Error(json?.error || 'Falha na busca')
+      const json: unknown = await res.json().catch(() => ({}))
+
+      // falha do proxy ou erro da API
+      if (!res.ok || (isObj(json) && json.ok === false)) {
+        const msg = isObj(json) && typeof json.error === 'string' ? json.error : 'Falha na busca'
+        throw new Error(msg)
       }
-      setRows((json?.data as Invoice[]) ?? [])
+
+      // json pode ser { data: [...] } ou { data: { ... } } – normalizamos para array
+      const dataField = isObj(json) ? (json as any).data : undefined
+      const list = toArray<Invoice>(dataField)
+      setRows(list)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      setRows([]) // evita iterar algo inválido
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => { void fetchData() }, [])
+  useEffect(() => { void fetchData() }, []) // carrega na entrada
 
   const totalByStatus = useMemo(() => {
     const acc: Record<string, number> = {}
