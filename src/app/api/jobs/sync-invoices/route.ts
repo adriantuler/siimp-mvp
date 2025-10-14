@@ -25,36 +25,56 @@ function normalizeRows(list: any[]): InvoiceRow[] {
 
 export async function GET(req: NextRequest) {
   try {
-    const sp = req.nextUrl.searchParams
-    // defaults do front, se não vierem
+    const sp = new URLSearchParams(req.nextUrl.searchParams)
+
+    // defaults iguais ao front
     if (!sp.has('status')) sp.set('status', '0')
     if (!sp.has('number_from')) sp.set('number_from', '1')
     if (!sp.has('number_to')) sp.set('number_to', '1000')
 
+    // paginação: usa ?page e ?limit se vierem, senão define
+    const limit = Math.max(1, parseInt(sp.get('limit') ?? '200', 10)) // pode ajustar
+    sp.set('limit', String(limit))
+
     const origin = req.nextUrl.origin
-    const url = `${origin}/api/invoices/search?${sp.toString()}`
+    let page = Math.max(1, parseInt(sp.get('page') ?? '1', 10))
+    let totalFetched = 0
+    const all: any[] = []
 
-    // 1) Busca ENRIQUECIDA (reusa sua rota /api/invoices/search)
-    const res = await fetch(url, { cache: 'no-store', headers: { 'x-sync-job': '1' } })
-    const json: any = await res.json().catch(() => ({}))
+    while (true) {
+      sp.set('page', String(page))
+      const url = `${origin}/api/invoices/search?${sp.toString()}`
 
-    const ok = res.ok && json?.ok !== false
-    const rows = ok && Array.isArray(json?.data) ? (json.data as any[]) : []
+      const res = await fetch(url, { cache: 'no-store', headers: { 'x-sync-job': '1' } })
+      const json: any = await res.json().catch(() => ({}))
 
-    // 2) Garante schema e persiste
-    await ensureSchema()
-    if (rows.length > 0) {
-      await upsertMany(normalizeRows(rows))
+      const ok = res.ok && json?.ok !== false
+      const items = ok && Array.isArray(json?.data) ? (json.data as any[]) : []
+
+      all.push(...items)
+      totalFetched += items.length
+
+      // critério de parada: última página (< limit) ou vazio
+      if (items.length < limit) break
+
+      // safe-guard para não laçar infinito
+      if (page > 5000) break
+      page += 1
     }
 
-    // 3) Resposta com debug explícito (fica fácil saber se é a rota certa)
+    await ensureSchema()
+    if (all.length) {
+      await upsertMany(normalizeRows(all))
+    }
+
     return NextResponse.json({
       ok: true,
       route: 'jobs/sync-invoices',
-      fetched_from: url,
-      fetched: rows.length,
-      wrote: rows.length,
-      sample_ids: rows.slice(0, 5).map(r => r.id),
+      fetched_pages: page,
+      page_size: limit,
+      fetched_total: totalFetched,
+      wrote: all.length,
+      sample_ids: all.slice(0, 5).map(r => r.id),
     })
   } catch (e: any) {
     return NextResponse.json({
