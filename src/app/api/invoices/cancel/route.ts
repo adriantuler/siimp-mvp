@@ -8,9 +8,11 @@ const DAC_USERNAME = process.env.DAC_USERNAME
 const DAC_PASSWORD = process.env.DAC_PASSWORD
 const DAC_COOKIE   = process.env.DAC_COOKIE // fallback: "PHPSESSID=abc123"
 
+// 🔧 Motivo padrão (pode sobrescrever via env)
+const DEFAULT_CANCEL_REASON = process.env.DEFAULT_CANCEL_REASON ?? 'Cancelado via portal'
+
 // Tenta logar e extrair o PHPSESSID. Se não houver credenciais, usa DAC_COOKIE.
 async function dacLoginAndGetCookie(): Promise<string> {
-  // Se tiver usuário/senha, tenta login
   if (DAC_USERNAME && DAC_PASSWORD) {
     const loginUrl = `${DAC_BASE_URL}/auth/login`
     const body = new URLSearchParams({ username: DAC_USERNAME, password: DAC_PASSWORD })
@@ -22,26 +24,22 @@ async function dacLoginAndGetCookie(): Promise<string> {
         Referer: loginUrl,
       },
       body,
-      redirect: 'manual', // não seguir para conseguir ler Set-Cookie do login
+      redirect: 'manual',
     })
 
-    // Pega todos os Set-Cookie (Node 18+/undici tem getSetCookie())
     const anyHeaders = res.headers as any
     const setCookies: string[] =
       typeof anyHeaders.getSetCookie === 'function'
         ? anyHeaders.getSetCookie()
         : [res.headers.get('set-cookie')].filter(Boolean) as string[]
 
-    // Extrai o PHPSESSID
     for (const sc of setCookies) {
       const m = /PHPSESSID=([^;]+)/i.exec(sc)
       if (m?.[1]) return `PHPSESSID=${m[1]}`
     }
   }
 
-  // Fallback para variável de ambiente
   if (DAC_COOKIE) return DAC_COOKIE
-
   throw new Error('Não foi possível obter a sessão do DAC (configure DAC_USERNAME/DAC_PASSWORD ou DAC_COOKIE).')
 }
 
@@ -56,7 +54,7 @@ async function cancelInDac(id: string | number) {
       'X-Requested-With': 'XMLHttpRequest',
       Origin: DAC_BASE_URL,
       Referer: `${DAC_BASE_URL}/`,
-      Cookie: cookie, // PHPSESSID=...
+      Cookie: cookie,
     },
     body: new URLSearchParams({ id: String(id) }),
   })
@@ -70,13 +68,20 @@ export async function POST(req: NextRequest) {
   const { id, reason, send_mail } = await req.json()
   if (!id) return NextResponse.json({ ok: false, error: 'id obrigatório' }, { status: 400 })
 
+  // 🔧 Defaults:
+  const motivo = (typeof reason === 'string' && reason.trim())
+    ? reason.trim()
+    : DEFAULT_CANCEL_REASON
+
+  const sendMail = typeof send_mail === 'boolean' ? send_mail : false
+
   // Executa Siimp e DAC em paralelo
   const [siimpRes, dacRes] = await Promise.allSettled([
     (async () => {
       try {
         const out = await siimp<any>('/invoices/cancel', {
           method: 'POST',
-          body: { id, reason, send_mail },
+          body: { id, reason: motivo, send_mail: sendMail },
         })
         return { ok: true, data: out }
       } catch (e: any) {
