@@ -7,7 +7,7 @@ type Row = {
   id: number
   action?: Action
   reason?: string
-  send_mail?: number
+  send_mail?: number | string | boolean
   paid_at?: string
   value?: number
   wallet_id?: number
@@ -22,6 +22,21 @@ function normalizeHeader(s: string) {
   return s?.toString().trim().toLowerCase().replace(/\s+/g, '_')
 }
 
+// 🔧 Motivo padrão no cliente (o servidor também tem o fallback dele)
+const DEFAULT_CANCEL_REASON = 'Cancelado via portal'
+
+// Normaliza "send_mail" vindo como 1/0, "true"/"false", boolean, etc.
+function coerceToBoolean(v: unknown, defaultValue = false): boolean {
+  if (typeof v === 'boolean') return v
+  if (v == null || v === '') return defaultValue
+  const s = String(v).trim().toLowerCase()
+  if (s === 'true' || s === '1') return true
+  if (s === 'false' || s === '0') return false
+  const n = Number(s)
+  if (!Number.isNaN(n)) return n !== 0
+  return defaultValue
+}
+
 function parseCSV(text: string): Row[] {
   const lines = text.split(/\r?\n/).filter(l => l.trim() !== '')
   if (!lines.length) return []
@@ -32,10 +47,12 @@ function parseCSV(text: string): Row[] {
     const obj: Record<string, unknown> = {}
     headers.forEach((h, idx) => (obj[h] = cols[idx]))
     if (obj.id != null) obj.id = Number(obj.id)
-    ;['value','wallet_id','payment_form','discount','send_mail'].forEach(k => {
+    ;['value','wallet_id','payment_form','discount'].forEach(k => {
       const v = obj[k]
       if (v !== undefined && v !== '') obj[k] = Number(v as string)
     })
+    // send_mail pode vir como 0/1
+    if (obj.send_mail !== undefined) obj.send_mail = coerceToBoolean(obj.send_mail)
     if (obj.action) {
       const a = String(obj.action).toLowerCase()
       obj.action = a === 'emitir' || a === 'send' ? 'send'
@@ -62,10 +79,11 @@ async function parseFile(file: File): Promise<Row[]> {
     const obj: Record<string, unknown> = {}
     Object.keys(r).forEach(k => (obj[normalizeHeader(k)] = r[k]))
     if (obj.id != null) obj.id = Number(obj.id)
-    ;['value','wallet_id','payment_form','discount','send_mail'].forEach(k => {
+    ;['value','wallet_id','payment_form','discount'].forEach(k => {
       const v = obj[k]
       if (v !== undefined && v !== '') obj[k] = Number(v as string)
     })
+    if (obj.send_mail !== undefined) obj.send_mail = coerceToBoolean(obj.send_mail)
     if (obj.action) {
       const a = String(obj.action).toLowerCase()
       obj.action = a === 'emitir' || a === 'send' ? 'send'
@@ -87,13 +105,13 @@ async function callAPI(action: Action, payload: unknown) {
     headers: { 'Content-Type':'application/json' },
     body: JSON.stringify(payload)
   })
-  const data: unknown = await res.json().catch(() => ({}))
-  const ok = res.ok && typeof data === 'object' && data !== null && (data as any).ok !== false
+  const data: any = await res.json().catch(() => ({}))
+  const ok = res.ok && data && data.ok !== false
   if (!ok) {
-    const msg = typeof data === 'object' && data && 'error' in data
-      ? String((data as any).error)
-      : `HTTP ${res.status}`
-    throw new Error(msg)
+    const msg = data?.error
+      ?? data?.message
+      ?? (typeof data === 'string' ? data : `HTTP ${res.status}`)
+    throw new Error(String(msg))
   }
   return data
 }
@@ -106,9 +124,7 @@ function validateRowFor(action: Action, r: Row) {
     if (r.wallet_id == null) return 'wallet_id ausente'
     if (r.payment_form == null) return 'payment_form ausente'
   }
-  if (action === 'cancel') {
-    if (!r.reason) return 'reason ausente'
-  }
+  // 🔧 Em cancel não exigimos mais reason (server/cliente têm fallback)
   return null
 }
 
@@ -156,14 +172,25 @@ export default function InvoicesBatchPage() {
       try {
         const payload =
           act === 'send' ? { id: r.id } :
-          act === 'cancel' ? { id: r.id, reason: r.reason, send_mail: r.send_mail ?? 0 } :
-          { id: r.id, paid_at: r.paid_at, value: r.value, wallet_id: r.wallet_id,
-            payment_form: r.payment_form, discount: r.discount ?? 0 }
+          act === 'cancel'
+            ? {
+                id: r.id,
+                reason: (r.reason && String(r.reason).trim()) || DEFAULT_CANCEL_REASON,
+                send_mail: coerceToBoolean(r.send_mail, false)
+              }
+            : {
+                id: r.id,
+                paid_at: r.paid_at,
+                value: r.value,
+                wallet_id: r.wallet_id,
+                payment_form: r.payment_form,
+                discount: r.discount ?? 0
+              }
         await callAPI(act, payload)
         out.push({ id: r.id, action: act, ok: true, message: 'OK' })
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
-        out.push({ id: r.id, action: act, ok: false, message: msg })
+        out.push({ id: r.id, action: (r.action || action) as Action, ok: false, message: msg })
       }
       setResults([...out])
       await sleep(1100) // respeita ~60 req/min
@@ -175,6 +202,7 @@ export default function InvoicesBatchPage() {
 
   async function downloadTemplate(fmt: 'csv'|'xlsx') {
     const headers = [
+      // reason agora é opcional; send_mail 0/1 (ou TRUE/FALSE)
       ['id','action','reason','send_mail','paid_at','value','wallet_id','payment_form','discount']
     ]
     if (fmt === 'csv') {
@@ -243,7 +271,7 @@ export default function InvoicesBatchPage() {
           </button>
         </div>
         <p className="mt-3 text-xs text-gray-600">
-          Colunas: <code>id</code> (obrigatório). Para <b>cancel</b>: <code>reason</code>, <code>send_mail</code>.
+          Colunas: <code>id</code> (obrigatório). Para <b>cancel</b>: <code>reason</code> <i>(opcional, usa "{DEFAULT_CANCEL_REASON}" se vazio)</i>, <code>send_mail</code> <i>(0/1 ou TRUE/FALSE)</i>.
           Para <b>pay</b>: <code>paid_at</code>, <code>value</code>, <code>wallet_id</code>, <code>payment_form</code>, <code>discount</code>.
           Opcional: <code>action</code> (<code>send</code>/<code>pay</code>/<code>cancel</code>).
         </p>
@@ -275,12 +303,12 @@ export default function InvoicesBatchPage() {
               </tr>
             </thead>
             <tbody>
-              {useMemo(() => rows.slice(0, 10), [rows]).map((r,i)=>(
+              {preview.map((r,i)=>(
                 <tr key={i} className="even:bg-gray-50 [&>td]:px-2 [&>td]:py-1">
                   <td className="font-mono">{r.id}</td>
                   <td>{r.action ?? ''}</td>
                   <td>{r.reason ?? ''}</td>
-                  <td>{r.send_mail ?? ''}</td>
+                  <td>{String(coerceToBoolean(r.send_mail, false))}</td>
                   <td>{r.paid_at ?? ''}</td>
                   <td>{r.value ?? ''}</td>
                   <td>{r.wallet_id ?? ''}</td>
