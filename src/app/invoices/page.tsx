@@ -5,7 +5,7 @@ import Link from 'next/link'
 
 type Invoice = {
   id: number
-  owner_id: number
+  owner_id?: number | string | null            // ⬅ enriquecido
   invoice_number: string
   invoice_status: 0 | 1 | 2 | 3
   total: string
@@ -13,6 +13,10 @@ type Invoice = {
   payment_form: number
   created_at: string
   invoice_obs?: string | null
+  // ⬇ enriquecidos do DAC
+  cte_id?: number | string | null
+  serie?: string | number | null
+  number?: number | string | null              // documents[0].number
 }
 
 const STATUS_MAP: Record<number, string> = {
@@ -54,19 +58,17 @@ export default function InvoicesPage() {
       const res = await fetch(`/api/invoices/search?${qs.toString()}`, { cache: 'no-store' })
       const json: unknown = await res.json().catch(() => ({}))
 
-      // falha do proxy ou erro da API
       if (!res.ok || (isObj(json) && json.ok === false)) {
-        const msg = isObj(json) && typeof json.error === 'string' ? json.error : 'Falha na busca'
+        const msg = isObj(json) && typeof (json as any).error === 'string' ? (json as any).error : 'Falha na busca'
         throw new Error(msg)
       }
 
-      // json pode ser { data: [...] } ou { data: { ... } } – normalizamos para array
       const dataField = isObj(json) ? (json as any).data : undefined
       const list = toArray<Invoice>(dataField)
       setRows(list)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
-      setRows([]) // evita iterar algo inválido
+      setRows([])
     } finally {
       setLoading(false)
     }
@@ -82,6 +84,9 @@ export default function InvoicesPage() {
     }
     return acc
   }, [rows])
+
+  // helper simples para exibir nulos/vazios
+  const show = (v: unknown) => (v === null || v === undefined || v === '' ? '' : String(v))
 
   return (
     <main className="p-6 space-y-6">
@@ -161,29 +166,37 @@ export default function InvoicesPage() {
           <thead className="bg-gray-100">
             <tr className="[&>th]:px-3 [&>th]:py-2 text-left">
               <th>ID</th>
-              <th>Nº</th>
+              <th>Owner</th>             {/* owner_id */}
+              <th>Nº NF</th>             {/* invoice_number */}
               <th>Status</th>
               <th>Total</th>
               <th>Vencimento</th>
               <th>Forma</th>
               <th>Criada em</th>
+              <th>CT-e ID</th>           {/* cte_id */}
+              <th>Série Doc</th>         {/* serie */}
+              <th>Nº Doc</th>            {/* number (documents[0].number) */}
             </tr>
           </thead>
           <tbody>
             {rows.map((r) => (
               <tr key={r.id} className="even:bg-gray-50 [&>td]:px-3 [&>td]:py-2">
                 <td className="font-mono">{r.id}</td>
+                <td className="font-mono">{show(r.owner_id)}</td>
                 <td>{r.invoice_number}</td>
                 <td>{STATUS_MAP[r.invoice_status] ?? r.invoice_status}</td>
                 <td>R$ {r.total}</td>
                 <td>{r.maturity}</td>
                 <td>{r.payment_form}</td>
                 <td>{r.created_at}</td>
+                <td className="font-mono">{show(r.cte_id)}</td>
+                <td>{show(r.serie)}</td>
+                <td className="font-mono">{show(r.number)}</td>
               </tr>
             ))}
             {rows.length === 0 && !loading && (
               <tr>
-                <td colSpan={7} className="text-center py-8 text-gray-500">
+                <td colSpan={11} className="text-center py-8 text-gray-500">
                   Sem resultados
                 </td>
               </tr>
