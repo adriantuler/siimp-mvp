@@ -47,7 +47,6 @@ type DacSlice = {
   number: number | string | null
 }
 
-// lê texto e tenta JSON (content-type pode vir errado)
 async function robustJson(res: Response): Promise<any | null> {
   const txt = await res.text().catch(() => '')
   if (!txt) return null
@@ -106,7 +105,6 @@ function normalizeToArray(base: any): any[] {
   return []
 }
 
-// map com limite de concorrência
 async function mapLimit<T, U>(
   arr: readonly T[],
   limit: number,
@@ -246,74 +244,91 @@ async function upsertInvoices(rows: any[]): Promise<number> {
   }
 }
 
-// --------------------- paginação no Siimp ---------------------
-type SiimpPage = { data: any[]; total?: number }
+// --------------------- BUSCA no Siimp com divisão por intervalo ---------------------
+let RANGE_CALLS = 0
 
-async function fetchSiimpPage(
-  baseQs: URLSearchParams,
-  mode: 'page' | 'start',
-  pageOrStart: number,
-  limit: number
-): Promise<SiimpPage> {
-  const qs = new URLSearchParams(baseQs.toString())
-  if (!qs.has('limit')) qs.set('limit', String(limit))
-  if (mode === 'page') {
-    qs.set('page', String(pageOrStart))
-    qs.delete('start')
-  } else {
-    qs.set('start', String(pageOrStart))
-    qs.delete('page')
-  }
-
-  const path = '/invoices/search' + (qs.toString() ? `?${qs.toString()}` : '')
-  const res = await siimp<any>(path, { method: 'GET' })
-  const rows = normalizeToArray(res)
-  const total = typeof res?.total === 'number' ? res.total : undefined
-  return { data: rows, total }
+function nInt(v: string | null, def: number): number {
+  if (!v) return def
+  const n = parseInt(v, 10)
+  return Number.isFinite(n) ? n : def
 }
 
-// --------------------- core ---------------------
-async function runSearch(req: NextRequest) {
+/**
+ * Faz 1 chamada ao Siimp para um intervalo [from..to].
+ * Se voltar exatamente 40 (cap), divide o intervalo ao meio e tenta de novo (recursivo).
+ */
+async function fetchRangeRecursive(
+  baseQs: URLSearchParams,
+  from: number,
+  to: number,
+  depth = 0
+): Promise<any[]> {
+  const qs = new URLSearchParams(baseQs.toString())
+  qs.set('number_from', String(from))
+  qs.set('number_to', String(to))
+  // OBS: Siimp ignora limit/page/start, então não insistimos aqui
+  const path = '/invoices/search' + (qs.toString() ? `?${qs.toString()}` : '')
+  const res = await siimp<any>(path, { method: 'GET' })
+  RANGE_CALLS++
+  const rows = normalizeToArray(res)
+
+  // Se o retorno for <40, está “quebrado” o bastante.
+  if (rows.length < 40) return rows
+
+  // Se foi 40 e o range tem mais de 1 número, divide e busca as metades.
+  if (from < to && rows.length === 40) {
+    // evita recursão infinita
+    if (depth > 20) return rows
+    const mid = Math.floor((from + to) / 2)
+    const left = await fetchRangeRecursive(baseQs, from, mid, depth + 1)
+    const right = await fetchRangeRecursive(baseQs, mid + 1, to, depth + 1)
+    return [...left, ...right]
+  }
+
+  return rows
+}
+
+/**
+ * Decide estratégia de busca:
+ * - Se vierem number_from/number_to -> usa divisão por intervalo (garante >40).
+ * - Caso contrário, faz apenas 1 fetch “simples”.
+ */
+async function fetchAllFromSiimp(req: NextRequest): Promise<{ rows: any[], strategy: string }> {
   const baseQs = req.method === 'GET'
     ? new URLSearchParams(req.nextUrl.searchParams)
     : new URLSearchParams()
 
-  // se vier POST com body, mantemos a compatibilidade (mas a paginação é por GET)
-  let bodyFromPost: any = {}
   if (req.method === 'POST') {
-    bodyFromPost = await req.json().catch(() => ({}))
-    for (const [k, v] of Object.entries(bodyFromPost)) {
+    const body = await req.json().catch(() => ({}))
+    for (const [k, v] of Object.entries(body)) {
       if (v != null) baseQs.set(k, String(v))
     }
   }
 
-  const limit = Math.min(500, Math.max(1, parseInt(baseQs.get('limit') ?? '200', 10)))
+  const hasRange = baseQs.has('number_from') || baseQs.has('number_to')
+  if (hasRange) {
+    const nFrom = nInt(baseQs.get('number_from'), 1)
+    const nTo   = nInt(baseQs.get('number_to'), 999999)
+    const rows = await fetchRangeRecursive(baseQs, Math.min(nFrom, nTo), Math.max(nFrom, nTo))
+    return { rows, strategy: 'range' }
+  }
 
-  let fetched_pages = 0
-  let fetched_total = 0
-  let wrote_total = 0
-  const allForResponse: any[] = []
+  // fallback: uma chamada simples (vai trazer até 40)
+  const path = '/invoices/search' + (baseQs.toString() ? `?${baseQs.toString()}` : '')
+  const res = await siimp<any>(path, { method: 'GET' })
+  return { rows: normalizeToArray(res), strategy: 'single' }
+}
 
-  // 1ª tentativa: paginação por 'page'
-  let mode: 'page' | 'start' = 'page'
-  let page = 1
+// --------------------- CORE ---------------------
+export async function GET(req: NextRequest) {
+  try {
+    RANGE_CALLS = 0
 
-  while (true) {
-    const { data, total } = await fetchSiimpPage(baseQs, mode, page, limit)
-    if (!data.length) {
-      // se na 1ª página de 'page' não veio nada, tente 'start'
-      if (fetched_pages === 0 && page === 1 && mode === 'page') {
-        mode = 'start'
-        break
-      }
-      break
-    }
+    // 1) BUSCA (com divisão por intervalo quando houver number_from/number_to)
+    const { rows, strategy } = await fetchAllFromSiimp(req)
 
-    fetched_pages++
-    fetched_total += data.length
-
-    // enrich
-    const enriched = await mapLimit(data, MAX_CONCURRENCY, async (r: any) => {
+    // 2) ENRICH + completar owner_name via /person
+    const enriched = await mapLimit(rows, MAX_CONCURRENCY, async (r: any) => {
       const id = r.id ?? r.invoice_id ?? r.ID
       if (!id) {
         return {
@@ -338,7 +353,6 @@ async function runSearch(req: NextRequest) {
       }
     })
 
-    // completa owner_name via /person
     const missingNameIds = Array.from(
       new Set(
         enriched
@@ -356,7 +370,6 @@ async function runSearch(req: NextRequest) {
       }
     }
 
-    // garante chaves
     const withKeys = enriched.map((r: any) => ({
       ...r,
       owner_id:   r.owner_id   ?? null,
@@ -366,119 +379,23 @@ async function runSearch(req: NextRequest) {
       number:     r.number     ?? null,
     }))
 
-    // upsert por página
-    wrote_total += await upsertInvoices(withKeys)
+    // 3) UPSERT no Neon
+    const wrote = await upsertInvoices(withKeys)
 
-    // acumula para resposta (cuidado com payloads enormes)
-    allForResponse.push(...withKeys)
-
-    // critério de parada
-    if (typeof total === 'number') {
-      const expectedPages = Math.ceil(total / limit)
-      if (page >= expectedPages) break
-    } else if (data.length < limit) {
-      break
-    }
-
-    page++
-  }
-
-  // se não paginou por 'page', tente 'start'
-  if (mode === 'start') {
-    let start = 0
-    while (true) {
-      const { data, total } = await fetchSiimpPage(baseQs, 'start', start, limit)
-      if (!data.length) break
-
-      fetched_pages++
-      fetched_total += data.length
-
-      // enrich
-      const enriched = await mapLimit(data, MAX_CONCURRENCY, async (r: any) => {
-        const id = r.id ?? r.invoice_id ?? r.ID
-        if (!id) {
-          return {
-            ...r,
-            owner_id:   r.owner_id ?? null,
-            owner_name: r.owner_name ?? r?.owner?.name ?? null,
-            cte_id:     r.cte_id   ?? null,
-            serie:      r.serie    ?? null,
-            number:     r.number   ?? null,
-          }
-        }
-        const s = await fetchDacSlice(id).catch(() => ({
-          owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
-        }))
-        return {
-          ...r,
-          owner_id:   r.owner_id   ?? s.owner_id,
-          owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
-          cte_id:     r.cte_id     ?? s.cte_id,
-          serie:      r.serie      ?? s.serie,
-          number:     r.number     ?? s.number,
-        }
-      })
-
-      // completa nomes
-      const missingNameIds = Array.from(
-        new Set(
-          enriched
-            .filter((r: any) => r.owner_id && !r.owner_name)
-            .map((r: any) => Number(r.owner_id))
-        )
-      )
-      if (missingNameIds.length) {
-        const nameMap = await fetchOwnerNames(missingNameIds)
-        for (const r of enriched) {
-          if (r.owner_id && !r.owner_name) {
-            const nm = nameMap[Number(r.owner_id)]
-            if (nm) r.owner_name = nm
-          }
-        }
-      }
-
-      const withKeys = enriched.map((r: any) => ({
-        ...r,
-        owner_id:   r.owner_id   ?? null,
-        owner_name: r.owner_name ?? null,
-        cte_id:     r.cte_id     ?? null,
-        serie:      r.serie      ?? null,
-        number:     r.number     ?? null,
-      }))
-
-      wrote_total += await upsertInvoices(withKeys)
-      allForResponse.push(...withKeys)
-
-      if (typeof total === 'number' && start + data.length >= total) break
-      if (data.length < limit) break
-
-      start += limit
-    }
-  }
-
-  return {
-    data: allForResponse,
-    fetched_pages,
-    fetched_total,
-    wrote: wrote_total,
-  }
-}
-
-// --------------------- handlers ---------------------
-export async function GET(req: NextRequest) {
-  try {
-    const { data, wrote, fetched_pages, fetched_total } = await runSearch(req)
-    return NextResponse.json({ ok: true, wrote, fetched_pages, fetched_total, data }, { status: 200 })
+    return NextResponse.json({
+      ok: true,
+      strategy,
+      range_calls: RANGE_CALLS,
+      fetched_total: withKeys.length,
+      wrote,
+      data: withKeys,
+    }, { status: 200 })
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
   }
 }
 
 export async function POST(req: NextRequest) {
-  try {
-    const { data, wrote, fetched_pages, fetched_total } = await runSearch(req)
-    return NextResponse.json({ ok: true, wrote, fetched_pages, fetched_total, data }, { status: 200 })
-  } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
-  }
+  // mesmo comportamento do GET (mantém compat)
+  return GET(req as unknown as NextRequest)
 }
