@@ -1,7 +1,7 @@
 // app/api/invoices/search/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { siimp } from '@/lib/siimp'
-import { query } from '@/lib/db' // << ADICIONADO
+import { query } from '@/lib/db'
 
 export const runtime = 'nodejs'
 
@@ -168,7 +168,6 @@ async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
 }
 
 // --------------------- persistência no Neon ---------------------
-
 type DbRow = {
   id: number
   owner_id: number | null
@@ -195,7 +194,7 @@ function shapeDbRow(r: any): DbRow {
     owner_name: r.owner_name ?? r.owner?.name ?? null,
     invoice_number: str(r.invoice_number ?? r.number),
     invoice_status: r.invoice_status != null ? Number(r.invoice_status) : null,
-    total: r.total ?? null, // string "0.01" já funciona no NUMERIC
+    total: r.total ?? null,
     maturity: str(r.maturity ?? r.expiration ?? r.competency_date ?? null),
     payment_form: r.payment_form != null ? Number(r.payment_form) : null,
     created_at: str(r.created_at ?? null),
@@ -213,7 +212,6 @@ async function upsertInvoices(rows: any[]): Promise<number> {
   try {
     for (const r of rows) {
       const x = shapeDbRow(r)
-      // OBS: synced_at = NOW() sempre que salva
       await query(
         `
         INSERT INTO invoices (
@@ -256,24 +254,64 @@ async function upsertInvoices(rows: any[]): Promise<number> {
   }
 }
 
-// --------------------- core ---------------------
+// --------------------- core (com paginação) ---------------------
 async function runSearch(req: NextRequest) {
-  // 1) busca no Siimp (GET com querystring ou POST com body)
-  let base: any
-  if (req.method === 'GET') {
-    const qs = req.nextUrl.searchParams
-    const path = '/invoices/search' + (qs.toString() ? `?${qs.toString()}` : '')
-    base = await siimp<any>(path, { method: 'GET' })
-  } else {
-    const body = await req.json().catch(() => ({}))
-    base = await siimp<any>('/invoices/search', { method: 'POST', body })
+  const isGet = req.method === 'GET'
+
+  // 1) Coleta filtros originais
+  const qs = isGet ? req.nextUrl.searchParams : undefined
+  // limite padrão maior para reduzir páginas
+  const limit = Math.min(
+    500,
+    Math.max(1, parseInt(qs?.get('limit') ?? '200', 10))
+  )
+  let page = parseInt(qs?.get('page') ?? '1', 10) || 1
+
+  // Para POST, leia o body uma única vez
+  const postBody = !isGet ? await req.json().catch(() => ({})) : null
+
+  // Helper para montar request ao Siimp
+  const buildGetPath = (p: number) => {
+    const q = new URLSearchParams(qs ?? '')
+    q.set('limit', String(limit))
+    q.set('page', String(p))
+    return '/invoices/search' + (q.toString() ? `?${q.toString()}` : '')
   }
 
-  const rows = normalizeToArray(base)
-  if (rows.length === 0) return { data: [], wrote: 0 }
+  // 2) Busca todas as páginas do Siimp até acabar
+  const allRows: any[] = []
+  while (true) {
+    let base: any
+    if (isGet) {
+      base = await siimp<any>(buildGetPath(page), { method: 'GET' })
+    } else {
+      const body = { ...(postBody as any), limit, page }
+      base = await siimp<any>('/invoices/search', { method: 'POST', body })
+    }
 
-  // 2) enriquece cada linha com dados do DAC (limitando concorrência)
-  const enriched = await mapLimit(rows, MAX_CONCURRENCY, async (r: any) => {
+    const rows = normalizeToArray(base)
+    if (rows.length === 0) break
+
+    allRows.push(...rows)
+
+    if (rows.length < limit) break // última página
+    page++
+  }
+
+  if (allRows.length === 0) return { data: [], wrote: 0, fetched_pages: 0, fetched_total: 0 }
+
+  // Dedup por id, se necessário
+  const seen = new Set<number | string>()
+  const uniqueRows = allRows.filter((r) => {
+    const id = r.id ?? r.invoice_id ?? r.ID
+    if (!id) return false
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+
+  // 3) Enriquecimento DAC (invoice)
+  const enriched = await mapLimit(uniqueRows, MAX_CONCURRENCY, async (r: any) => {
     const id = r.id ?? r.invoice_id ?? r.ID
     if (!id) {
       return {
@@ -298,7 +336,7 @@ async function runSearch(req: NextRequest) {
     }
   })
 
-  // 2b) completa owner_name faltante consultando /person em lote
+  // 3b) Completa owner_name via /person em lote quando faltar
   const missingNameIds = Array.from(
     new Set(
       enriched
@@ -316,7 +354,7 @@ async function runSearch(req: NextRequest) {
     }
   }
 
-  // 3) garante que as chaves existam mesmo se algum enrich falhar
+  // 4) Garante chaves e salva no banco (UPSERT)
   const withKeys = enriched.map((r: any) => ({
     ...r,
     owner_id:   r.owner_id   ?? null,
@@ -326,17 +364,16 @@ async function runSearch(req: NextRequest) {
     number:     r.number     ?? null,
   }))
 
-  // 4) SALVA NO BANCO (UPSERT)
   const wrote = await upsertInvoices(withKeys)
 
-  return { data: withKeys, wrote }
+  return { data: withKeys, wrote, fetched_pages: page - 0, fetched_total: uniqueRows.length }
 }
 
 // --------------------- handlers ---------------------
 export async function GET(req: NextRequest) {
   try {
-    const { data, wrote } = await runSearch(req)
-    return NextResponse.json({ ok: true, wrote, data }, { status: 200 })
+    const { data, wrote, fetched_pages, fetched_total } = await runSearch(req)
+    return NextResponse.json({ ok: true, wrote, fetched_pages, fetched_total, data }, { status: 200 })
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
   }
@@ -344,8 +381,8 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const { data, wrote } = await runSearch(req)
-    return NextResponse.json({ ok: true, wrote, data }, { status: 200 })
+    const { data, wrote, fetched_pages, fetched_total } = await runSearch(req)
+    return NextResponse.json({ ok: true, wrote, fetched_pages, fetched_total, data }, { status: 200 })
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
   }
