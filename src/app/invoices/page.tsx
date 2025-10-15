@@ -166,7 +166,7 @@ export default function InvoicesPage() {
           <thead className="bg-gray-100">
             <tr className="[&>th]:px-3 [&>th]:py-2 text-left">
               <th>ID</th>
-              <th>Owner</th>             {/* owner_id */}
+              <th>OwnerID</th>             {/* owner_id */}
               <th>Nº NF</th>             {/* invoice_number */}
               <th>Status</th>
               <th>Total</th>

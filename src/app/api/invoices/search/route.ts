@@ -42,6 +42,7 @@ async function getDacSessionCookie(): Promise<string> {
 
 type DacSlice = {
   owner_id: number | string | null
+  owner_name: string | null
   cte_id: number | string | null
   serie: string | number | null
   number: number | string | null
@@ -54,7 +55,7 @@ async function robustJson(res: Response): Promise<any | null> {
   try { return JSON.parse(txt) } catch { return null }
 }
 
-// Busca owner_id / cte_id / serie / number para um ID no DAC
+// Busca owner_id / cte_id / serie / number (+ tenta owner_name) para um ID no DAC
 async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const cookie = await getDacSessionCookie()
   const url = new URL(`${DAC_BASE_URL}/invoice`)
@@ -63,7 +64,6 @@ async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   url.searchParams.set('page', '1')
   url.searchParams.set('start', '0')
   url.searchParams.set('limit', '40')
-  // url.searchParams.set('_dc', Date.now().toString()) // opcional
 
   const res = await fetch(url.toString(), {
     method: 'GET',
@@ -78,15 +78,25 @@ async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const payload = await robustJson(res)
 
   if (!res.ok || !payload?.success || !Array.isArray(payload?.data) || payload.data.length === 0) {
-    return { owner_id: null, cte_id: null, serie: null, number: null }
+    return { owner_id: null, owner_name: null, cte_id: null, serie: null, number: null }
   }
 
   const rec = payload.data[0] || {}
   const docs: any[] = Array.isArray(rec.documents) ? rec.documents : []
   const doc = docs[0] || {}
 
+  const ownerIdCandidate = [
+    rec.owner_id,
+    rec?.owner_id,
+    rec?.owner?.owner_id,
+    rec?.owner?.id,
+  ].find(v => v !== undefined && v !== null && v !== '')
+
+  const ownerNameCandidate = rec?.owner?.name ?? rec?.owner_name ?? null
+
   return {
-    owner_id: rec.owner_id ?? rec?.owner?.id ?? null,
+    owner_id: ownerIdCandidate ?? null,
+    owner_name: ownerNameCandidate ?? null,
     cte_id:   doc?.cte_id ?? null,
     serie:    doc?.serie ?? null,
     number:   doc?.number ?? null,
@@ -119,6 +129,43 @@ async function mapLimit<T, U>(
   return ret
 }
 
+// Helpers para /person
+function encodeFilter(obj: unknown) {
+  return encodeURIComponent(JSON.stringify(obj))
+}
+
+// Busca nomes por uma lista de owner_ids no DAC /person
+async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
+  if (!ids.length) return {}
+  const cookie = await getDacSessionCookie()
+  const url = new URL(`${DAC_BASE_URL}/person`)
+  url.searchParams.set('page', '1')
+  url.searchParams.set('start', '0')
+  url.searchParams.set('limit', String(Math.max(40, ids.length)))
+  url.searchParams.set('filter', encodeFilter([{ property: 'ids', value: ids.join(',') }]))
+
+  const res = await fetch(url.toString(), {
+    method: 'GET',
+    headers: {
+      Cookie: cookie,
+      'X-Requested-With': 'XMLHttpRequest',
+      Referer: `${DAC_BASE_URL}/`,
+      Accept: 'application/json, */*',
+    },
+  })
+
+  const payload = await robustJson(res)
+  const out: Record<number, string> = {}
+  if (res.ok && payload?.success && Array.isArray(payload?.data)) {
+    for (const p of payload.data) {
+      const k = Number(p?.id ?? p?.owner_id)
+      const name = p?.name ?? p?.fancy_name ?? null
+      if (k && name) out[k] = String(name)
+    }
+  }
+  return out
+}
+
 // --------------------- core ---------------------
 async function runSearch(req: NextRequest) {
   // 1) busca no Siimp (GET com querystring ou POST com body)
@@ -141,29 +188,52 @@ async function runSearch(req: NextRequest) {
     if (!id) {
       return {
         ...r,
-        owner_id: r.owner_id ?? null,
-        cte_id:   r.cte_id   ?? null,
-        serie:    r.serie    ?? null,
-        number:   r.number   ?? null,
+        owner_id:   r.owner_id ?? null,
+        owner_name: r.owner_name ?? r?.owner?.name ?? null,
+        cte_id:     r.cte_id   ?? null,
+        serie:      r.serie    ?? null,
+        number:     r.number   ?? null,
       }
     }
-    const s = await fetchDacSlice(id).catch(() => ({ owner_id: null, cte_id: null, serie: null, number: null }))
+    const s = await fetchDacSlice(id).catch(() => ({
+      owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
+    }))
     return {
       ...r,
-      owner_id: r.owner_id ?? s.owner_id,
-      cte_id:   r.cte_id   ?? s.cte_id,
-      serie:    r.serie    ?? s.serie,
-      number:   r.number   ?? s.number,
+      owner_id:   r.owner_id   ?? s.owner_id,
+      owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
+      cte_id:     r.cte_id     ?? s.cte_id,
+      serie:      r.serie      ?? s.serie,
+      number:     r.number     ?? s.number,
     }
   })
+
+  // 2b) completa owner_name faltante consultando /person em lote
+  const missingNameIds = Array.from(
+    new Set(
+      enriched
+        .filter((r: any) => r.owner_id && !r.owner_name)
+        .map((r: any) => Number(r.owner_id))
+    )
+  )
+  if (missingNameIds.length) {
+    const nameMap = await fetchOwnerNames(missingNameIds)
+    for (const r of enriched) {
+      if (r.owner_id && !r.owner_name) {
+        const nm = nameMap[Number(r.owner_id)]
+        if (nm) r.owner_name = nm
+      }
+    }
+  }
 
   // 3) garante que as chaves existam mesmo se algum enrich falhar
   const withKeys = enriched.map((r: any) => ({
     ...r,
-    owner_id: r.owner_id ?? null,
-    cte_id:   r.cte_id   ?? null,
-    serie:    r.serie    ?? null,
-    number:   r.number   ?? null,
+    owner_id:   r.owner_id   ?? null,
+    owner_name: r.owner_name ?? null,
+    cte_id:     r.cte_id     ?? null,
+    serie:      r.serie      ?? null,
+    number:     r.number     ?? null,
   }))
 
   return withKeys
