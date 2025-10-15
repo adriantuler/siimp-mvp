@@ -8,10 +8,10 @@ export const runtime = 'nodejs'
 const DAC_BASE_URL = process.env.DAC_BASE_URL ?? 'https://dac.s1mp.net'
 const DAC_USERNAME = process.env.DAC_USERNAME
 const DAC_PASSWORD = process.env.DAC_PASSWORD
-const DAC_COOKIE   = process.env.DAC_COOKIE // ex.: "PHPSESSID=abc123"
+const DAC_COOKIE   = process.env.DAC_COOKIE
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.DAC_ENRICH_CONCURRENCY ?? '4', 10))
 
-// --------------------- utils ---------------------
+// --------------------- utils DAC ---------------------
 function extractPhpSessId(setCookie: string | null): string | null {
   if (!setCookie) return null
   const m = /PHPSESSID=([^;]+)/i.exec(setCookie)
@@ -20,7 +20,6 @@ function extractPhpSessId(setCookie: string | null): string | null {
 
 async function getDacSessionCookie(): Promise<string> {
   if (DAC_COOKIE && DAC_COOKIE.trim()) return DAC_COOKIE.trim()
-
   if (DAC_USERNAME && DAC_PASSWORD) {
     const loginUrl = `${DAC_BASE_URL}/auth/login`
     const body = new URLSearchParams({ username: DAC_USERNAME, password: DAC_PASSWORD })
@@ -37,7 +36,6 @@ async function getDacSessionCookie(): Promise<string> {
     const cookie = extractPhpSessId(res.headers.get('set-cookie'))
     if (cookie) return cookie
   }
-
   throw new Error('Sessão do DAC indisponível (configure DAC_COOKIE ou DAC_USERNAME/DAC_PASSWORD).')
 }
 
@@ -49,14 +47,13 @@ type DacSlice = {
   number: number | string | null
 }
 
-// Lê sempre como texto e tenta JSON.parse (content-type do DAC pode vir errado)
+// lê texto e tenta JSON (content-type pode vir errado)
 async function robustJson(res: Response): Promise<any | null> {
   const txt = await res.text().catch(() => '')
   if (!txt) return null
   try { return JSON.parse(txt) } catch { return null }
 }
 
-// Busca owner_id / cte_id / serie / number (+ tenta owner_name) para um ID no DAC
 async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const cookie = await getDacSessionCookie()
   const url = new URL(`${DAC_BASE_URL}/invoice`)
@@ -69,15 +66,13 @@ async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const res = await fetch(url.toString(), {
     method: 'GET',
     headers: {
-      Cookie: cookie, // "PHPSESSID=..."
+      Cookie: cookie,
       'X-Requested-With': 'XMLHttpRequest',
       Referer: `${DAC_BASE_URL}/`,
       Accept: 'application/json, */*',
     },
   })
-
   const payload = await robustJson(res)
-
   if (!res.ok || !payload?.success || !Array.isArray(payload?.data) || payload.data.length === 0) {
     return { owner_id: null, owner_name: null, cte_id: null, serie: null, number: null }
   }
@@ -111,7 +106,7 @@ function normalizeToArray(base: any): any[] {
   return []
 }
 
-// map com limite de concorrência para não sobrecarregar o DAC
+// map com limite de concorrência
 async function mapLimit<T, U>(
   arr: readonly T[],
   limit: number,
@@ -130,12 +125,11 @@ async function mapLimit<T, U>(
   return ret
 }
 
-// Helpers para /person
+// --------------------- /person (nomes) ---------------------
 function encodeFilter(obj: unknown) {
   return encodeURIComponent(JSON.stringify(obj))
 }
 
-// Busca nomes por uma lista de owner_ids no DAC /person
 async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
   if (!ids.length) return {}
   const cookie = await getDacSessionCookie()
@@ -185,9 +179,7 @@ type DbRow = {
 }
 
 function shapeDbRow(r: any): DbRow {
-  const num = (v: any) => (v === '' || v === null || v === undefined ? null : Number(v))
   const str = (v: any) => (v === undefined ? null : v === null ? null : String(v))
-
   return {
     id: Number(r.id ?? r.invoice_id ?? r.ID),
     owner_id: r.owner_id != null ? Number(r.owner_id) : (r.owner?.owner_id ?? r.owner?.id ?? null),
@@ -254,119 +246,222 @@ async function upsertInvoices(rows: any[]): Promise<number> {
   }
 }
 
-// --------------------- core (com paginação) ---------------------
-async function runSearch(req: NextRequest) {
-  const isGet = req.method === 'GET'
+// --------------------- paginação no Siimp ---------------------
+type SiimpPage = { data: any[]; total?: number }
 
-  // 1) Coleta filtros originais
-  const qs = isGet ? req.nextUrl.searchParams : undefined
-  // limite padrão maior para reduzir páginas
-  const limit = Math.min(
-    500,
-    Math.max(1, parseInt(qs?.get('limit') ?? '200', 10))
-  )
-  let page = parseInt(qs?.get('page') ?? '1', 10) || 1
-
-  // Para POST, leia o body uma única vez
-  const postBody = !isGet ? await req.json().catch(() => ({})) : null
-
-  // Helper para montar request ao Siimp
-  const buildGetPath = (p: number) => {
-    const q = new URLSearchParams(qs ?? '')
-    q.set('limit', String(limit))
-    q.set('page', String(p))
-    return '/invoices/search' + (q.toString() ? `?${q.toString()}` : '')
+async function fetchSiimpPage(
+  baseQs: URLSearchParams,
+  mode: 'page' | 'start',
+  pageOrStart: number,
+  limit: number
+): Promise<SiimpPage> {
+  const qs = new URLSearchParams(baseQs.toString())
+  if (!qs.has('limit')) qs.set('limit', String(limit))
+  if (mode === 'page') {
+    qs.set('page', String(pageOrStart))
+    qs.delete('start')
+  } else {
+    qs.set('start', String(pageOrStart))
+    qs.delete('page')
   }
 
-  // 2) Busca todas as páginas do Siimp até acabar
-  const allRows: any[] = []
+  const path = '/invoices/search' + (qs.toString() ? `?${qs.toString()}` : '')
+  const res = await siimp<any>(path, { method: 'GET' })
+  const rows = normalizeToArray(res)
+  const total = typeof res?.total === 'number' ? res.total : undefined
+  return { data: rows, total }
+}
+
+// --------------------- core ---------------------
+async function runSearch(req: NextRequest) {
+  const baseQs = req.method === 'GET'
+    ? new URLSearchParams(req.nextUrl.searchParams)
+    : new URLSearchParams()
+
+  // se vier POST com body, mantemos a compatibilidade (mas a paginação é por GET)
+  let bodyFromPost: any = {}
+  if (req.method === 'POST') {
+    bodyFromPost = await req.json().catch(() => ({}))
+    for (const [k, v] of Object.entries(bodyFromPost)) {
+      if (v != null) baseQs.set(k, String(v))
+    }
+  }
+
+  const limit = Math.min(500, Math.max(1, parseInt(baseQs.get('limit') ?? '200', 10)))
+
+  let fetched_pages = 0
+  let fetched_total = 0
+  let wrote_total = 0
+  const allForResponse: any[] = []
+
+  // 1ª tentativa: paginação por 'page'
+  let mode: 'page' | 'start' = 'page'
+  let page = 1
+
   while (true) {
-    let base: any
-    if (isGet) {
-      base = await siimp<any>(buildGetPath(page), { method: 'GET' })
-    } else {
-      const body = { ...(postBody as any), limit, page }
-      base = await siimp<any>('/invoices/search', { method: 'POST', body })
+    const { data, total } = await fetchSiimpPage(baseQs, mode, page, limit)
+    if (!data.length) {
+      // se na 1ª página de 'page' não veio nada, tente 'start'
+      if (fetched_pages === 0 && page === 1 && mode === 'page') {
+        mode = 'start'
+        break
+      }
+      break
     }
 
-    const rows = normalizeToArray(base)
-    if (rows.length === 0) break
+    fetched_pages++
+    fetched_total += data.length
 
-    allRows.push(...rows)
+    // enrich
+    const enriched = await mapLimit(data, MAX_CONCURRENCY, async (r: any) => {
+      const id = r.id ?? r.invoice_id ?? r.ID
+      if (!id) {
+        return {
+          ...r,
+          owner_id:   r.owner_id ?? null,
+          owner_name: r.owner_name ?? r?.owner?.name ?? null,
+          cte_id:     r.cte_id   ?? null,
+          serie:      r.serie    ?? null,
+          number:     r.number   ?? null,
+        }
+      }
+      const s = await fetchDacSlice(id).catch(() => ({
+        owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
+      }))
+      return {
+        ...r,
+        owner_id:   r.owner_id   ?? s.owner_id,
+        owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
+        cte_id:     r.cte_id     ?? s.cte_id,
+        serie:      r.serie      ?? s.serie,
+        number:     r.number     ?? s.number,
+      }
+    })
 
-    if (rows.length < limit) break // última página
+    // completa owner_name via /person
+    const missingNameIds = Array.from(
+      new Set(
+        enriched
+          .filter((r: any) => r.owner_id && !r.owner_name)
+          .map((r: any) => Number(r.owner_id))
+      )
+    )
+    if (missingNameIds.length) {
+      const nameMap = await fetchOwnerNames(missingNameIds)
+      for (const r of enriched) {
+        if (r.owner_id && !r.owner_name) {
+          const nm = nameMap[Number(r.owner_id)]
+          if (nm) r.owner_name = nm
+        }
+      }
+    }
+
+    // garante chaves
+    const withKeys = enriched.map((r: any) => ({
+      ...r,
+      owner_id:   r.owner_id   ?? null,
+      owner_name: r.owner_name ?? null,
+      cte_id:     r.cte_id     ?? null,
+      serie:      r.serie      ?? null,
+      number:     r.number     ?? null,
+    }))
+
+    // upsert por página
+    wrote_total += await upsertInvoices(withKeys)
+
+    // acumula para resposta (cuidado com payloads enormes)
+    allForResponse.push(...withKeys)
+
+    // critério de parada
+    if (typeof total === 'number') {
+      const expectedPages = Math.ceil(total / limit)
+      if (page >= expectedPages) break
+    } else if (data.length < limit) {
+      break
+    }
+
     page++
   }
 
-  if (allRows.length === 0) return { data: [], wrote: 0, fetched_pages: 0, fetched_total: 0 }
+  // se não paginou por 'page', tente 'start'
+  if (mode === 'start') {
+    let start = 0
+    while (true) {
+      const { data, total } = await fetchSiimpPage(baseQs, 'start', start, limit)
+      if (!data.length) break
 
-  // Dedup por id, se necessário
-  const seen = new Set<number | string>()
-  const uniqueRows = allRows.filter((r) => {
-    const id = r.id ?? r.invoice_id ?? r.ID
-    if (!id) return false
-    if (seen.has(id)) return false
-    seen.add(id)
-    return true
-  })
+      fetched_pages++
+      fetched_total += data.length
 
-  // 3) Enriquecimento DAC (invoice)
-  const enriched = await mapLimit(uniqueRows, MAX_CONCURRENCY, async (r: any) => {
-    const id = r.id ?? r.invoice_id ?? r.ID
-    if (!id) {
-      return {
+      // enrich
+      const enriched = await mapLimit(data, MAX_CONCURRENCY, async (r: any) => {
+        const id = r.id ?? r.invoice_id ?? r.ID
+        if (!id) {
+          return {
+            ...r,
+            owner_id:   r.owner_id ?? null,
+            owner_name: r.owner_name ?? r?.owner?.name ?? null,
+            cte_id:     r.cte_id   ?? null,
+            serie:      r.serie    ?? null,
+            number:     r.number   ?? null,
+          }
+        }
+        const s = await fetchDacSlice(id).catch(() => ({
+          owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
+        }))
+        return {
+          ...r,
+          owner_id:   r.owner_id   ?? s.owner_id,
+          owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
+          cte_id:     r.cte_id     ?? s.cte_id,
+          serie:      r.serie      ?? s.serie,
+          number:     r.number     ?? s.number,
+        }
+      })
+
+      // completa nomes
+      const missingNameIds = Array.from(
+        new Set(
+          enriched
+            .filter((r: any) => r.owner_id && !r.owner_name)
+            .map((r: any) => Number(r.owner_id))
+        )
+      )
+      if (missingNameIds.length) {
+        const nameMap = await fetchOwnerNames(missingNameIds)
+        for (const r of enriched) {
+          if (r.owner_id && !r.owner_name) {
+            const nm = nameMap[Number(r.owner_id)]
+            if (nm) r.owner_name = nm
+          }
+        }
+      }
+
+      const withKeys = enriched.map((r: any) => ({
         ...r,
-        owner_id:   r.owner_id ?? null,
-        owner_name: r.owner_name ?? r?.owner?.name ?? null,
-        cte_id:     r.cte_id   ?? null,
-        serie:      r.serie    ?? null,
-        number:     r.number   ?? null,
-      }
-    }
-    const s = await fetchDacSlice(id).catch(() => ({
-      owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
-    }))
-    return {
-      ...r,
-      owner_id:   r.owner_id   ?? s.owner_id,
-      owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
-      cte_id:     r.cte_id     ?? s.cte_id,
-      serie:      r.serie      ?? s.serie,
-      number:     r.number     ?? s.number,
-    }
-  })
+        owner_id:   r.owner_id   ?? null,
+        owner_name: r.owner_name ?? null,
+        cte_id:     r.cte_id     ?? null,
+        serie:      r.serie      ?? null,
+        number:     r.number     ?? null,
+      }))
 
-  // 3b) Completa owner_name via /person em lote quando faltar
-  const missingNameIds = Array.from(
-    new Set(
-      enriched
-        .filter((r: any) => r.owner_id && !r.owner_name)
-        .map((r: any) => Number(r.owner_id))
-    )
-  )
-  if (missingNameIds.length) {
-    const nameMap = await fetchOwnerNames(missingNameIds)
-    for (const r of enriched) {
-      if (r.owner_id && !r.owner_name) {
-        const nm = nameMap[Number(r.owner_id)]
-        if (nm) r.owner_name = nm
-      }
+      wrote_total += await upsertInvoices(withKeys)
+      allForResponse.push(...withKeys)
+
+      if (typeof total === 'number' && start + data.length >= total) break
+      if (data.length < limit) break
+
+      start += limit
     }
   }
 
-  // 4) Garante chaves e salva no banco (UPSERT)
-  const withKeys = enriched.map((r: any) => ({
-    ...r,
-    owner_id:   r.owner_id   ?? null,
-    owner_name: r.owner_name ?? null,
-    cte_id:     r.cte_id     ?? null,
-    serie:      r.serie      ?? null,
-    number:     r.number     ?? null,
-  }))
-
-  const wrote = await upsertInvoices(withKeys)
-
-  return { data: withKeys, wrote, fetched_pages: page - 0, fetched_total: uniqueRows.length }
+  return {
+    data: allForResponse,
+    fetched_pages,
+    fetched_total,
+    wrote: wrote_total,
+  }
 }
 
 // --------------------- handlers ---------------------
