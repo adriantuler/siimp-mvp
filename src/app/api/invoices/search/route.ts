@@ -1,6 +1,7 @@
 // app/api/invoices/search/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { siimp } from '@/lib/siimp'
+import { query } from '@/lib/db' // << ADICIONADO
 
 export const runtime = 'nodejs'
 
@@ -166,6 +167,95 @@ async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
   return out
 }
 
+// --------------------- persistência no Neon ---------------------
+
+type DbRow = {
+  id: number
+  owner_id: number | null
+  owner_name: string | null
+  invoice_number: string | null
+  invoice_status: number | null
+  total: string | number | null
+  maturity: string | null
+  payment_form: number | null
+  created_at: string | null
+  invoice_obs: string | null
+  cte_id: number | null
+  serie: string | number | null
+  number: number | string | null
+}
+
+function shapeDbRow(r: any): DbRow {
+  const num = (v: any) => (v === '' || v === null || v === undefined ? null : Number(v))
+  const str = (v: any) => (v === undefined ? null : v === null ? null : String(v))
+
+  return {
+    id: Number(r.id ?? r.invoice_id ?? r.ID),
+    owner_id: r.owner_id != null ? Number(r.owner_id) : (r.owner?.owner_id ?? r.owner?.id ?? null),
+    owner_name: r.owner_name ?? r.owner?.name ?? null,
+    invoice_number: str(r.invoice_number ?? r.number),
+    invoice_status: r.invoice_status != null ? Number(r.invoice_status) : null,
+    total: r.total ?? null, // string "0.01" já funciona no NUMERIC
+    maturity: str(r.maturity ?? r.expiration ?? r.competency_date ?? null),
+    payment_form: r.payment_form != null ? Number(r.payment_form) : null,
+    created_at: str(r.created_at ?? null),
+    invoice_obs: str(r.invoice_obs ?? null),
+    cte_id: r.cte_id != null ? Number(r.cte_id) : null,
+    serie: str(r.serie ?? null),
+    number: r.number != null ? Number(r.number) : null,
+  }
+}
+
+async function upsertInvoices(rows: any[]): Promise<number> {
+  if (!rows.length) return 0
+  let wrote = 0
+  await query('BEGIN')
+  try {
+    for (const r of rows) {
+      const x = shapeDbRow(r)
+      // OBS: synced_at = NOW() sempre que salva
+      await query(
+        `
+        INSERT INTO invoices (
+          id, owner_id, owner_name, invoice_number, invoice_status, total,
+          maturity, payment_form, created_at, invoice_obs,
+          cte_id, serie, number, synced_at
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,
+          $7,$8,$9,$10,
+          $11,$12,$13, NOW()
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          owner_id = EXCLUDED.owner_id,
+          owner_name = EXCLUDED.owner_name,
+          invoice_number = EXCLUDED.invoice_number,
+          invoice_status = EXCLUDED.invoice_status,
+          total = EXCLUDED.total,
+          maturity = EXCLUDED.maturity,
+          payment_form = EXCLUDED.payment_form,
+          created_at = EXCLUDED.created_at,
+          invoice_obs = EXCLUDED.invoice_obs,
+          cte_id = EXCLUDED.cte_id,
+          serie = EXCLUDED.serie,
+          number = EXCLUDED.number,
+          synced_at = NOW()
+        `,
+        [
+          x.id, x.owner_id, x.owner_name, x.invoice_number, x.invoice_status, x.total,
+          x.maturity, x.payment_form, x.created_at, x.invoice_obs,
+          x.cte_id, x.serie, x.number,
+        ]
+      )
+      wrote++
+    }
+    await query('COMMIT')
+    return wrote
+  } catch (e) {
+    await query('ROLLBACK')
+    throw e
+  }
+}
+
 // --------------------- core ---------------------
 async function runSearch(req: NextRequest) {
   // 1) busca no Siimp (GET com querystring ou POST com body)
@@ -180,7 +270,7 @@ async function runSearch(req: NextRequest) {
   }
 
   const rows = normalizeToArray(base)
-  if (rows.length === 0) return []
+  if (rows.length === 0) return { data: [], wrote: 0 }
 
   // 2) enriquece cada linha com dados do DAC (limitando concorrência)
   const enriched = await mapLimit(rows, MAX_CONCURRENCY, async (r: any) => {
@@ -236,14 +326,17 @@ async function runSearch(req: NextRequest) {
     number:     r.number     ?? null,
   }))
 
-  return withKeys
+  // 4) SALVA NO BANCO (UPSERT)
+  const wrote = await upsertInvoices(withKeys)
+
+  return { data: withKeys, wrote }
 }
 
 // --------------------- handlers ---------------------
 export async function GET(req: NextRequest) {
   try {
-    const data = await runSearch(req)
-    return NextResponse.json({ ok: true, data }, { status: 200 })
+    const { data, wrote } = await runSearch(req)
+    return NextResponse.json({ ok: true, wrote, data }, { status: 200 })
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
   }
@@ -251,8 +344,8 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const data = await runSearch(req)
-    return NextResponse.json({ ok: true, data }, { status: 200 })
+    const { data, wrote } = await runSearch(req)
+    return NextResponse.json({ ok: true, wrote, data }, { status: 200 })
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Erro no search' }, { status: 400 })
   }
