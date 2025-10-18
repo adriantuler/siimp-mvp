@@ -11,7 +11,9 @@ const DAC_PASSWORD = process.env.DAC_PASSWORD
 const DAC_COOKIE   = process.env.DAC_COOKIE
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.DAC_ENRICH_CONCURRENCY ?? '4', 10))
 
-// --------------------- utils DAC ---------------------
+// ---------- helpers ----------
+const onlyDigits = (s: any) => (s == null ? null : String(s).replace(/\D+/g, '') || null)
+
 function extractPhpSessId(setCookie: string | null): string | null {
   if (!setCookie) return null
   const m = /PHPSESSID=([^;]+)/i.exec(setCookie)
@@ -42,6 +44,7 @@ async function getDacSessionCookie(): Promise<string> {
 type DacSlice = {
   owner_id: number | string | null
   owner_name: string | null
+  owner_cnpj: string | null
   cte_id: number | string | null
   serie: string | number | null
   number: number | string | null
@@ -53,6 +56,7 @@ async function robustJson(res: Response): Promise<any | null> {
   try { return JSON.parse(txt) } catch { return null }
 }
 
+// Busca no DAC /invoice
 async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const cookie = await getDacSessionCookie()
   const url = new URL(`${DAC_BASE_URL}/invoice`)
@@ -73,7 +77,7 @@ async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   })
   const payload = await robustJson(res)
   if (!res.ok || !payload?.success || !Array.isArray(payload?.data) || payload.data.length === 0) {
-    return { owner_id: null, owner_name: null, cte_id: null, serie: null, number: null }
+    return { owner_id: null, owner_name: null, owner_cnpj: null, cte_id: null, serie: null, number: null }
   }
 
   const rec = payload.data[0] || {}
@@ -81,17 +85,16 @@ async function fetchDacSlice(id: number | string): Promise<DacSlice> {
   const doc = docs[0] || {}
 
   const ownerIdCandidate = [
-    rec.owner_id,
-    rec?.owner_id,
-    rec?.owner?.owner_id,
-    rec?.owner?.id,
+    rec.owner_id, rec?.owner_id, rec?.owner?.owner_id, rec?.owner?.id,
   ].find(v => v !== undefined && v !== null && v !== '')
 
   const ownerNameCandidate = rec?.owner?.name ?? rec?.owner_name ?? null
+  const ownerCnpjDigits    = onlyDigits(rec?.owner?.cnpj ?? rec?.owner_cnpj ?? null)
 
   return {
     owner_id: ownerIdCandidate ?? null,
     owner_name: ownerNameCandidate ?? null,
+    owner_cnpj: ownerCnpjDigits ?? null,
     cte_id:   doc?.cte_id ?? null,
     serie:    doc?.serie ?? null,
     number:   doc?.number ?? null,
@@ -105,11 +108,7 @@ function normalizeToArray(base: any): any[] {
   return []
 }
 
-async function mapLimit<T, U>(
-  arr: readonly T[],
-  limit: number,
-  iter: (item: T, index: number) => Promise<U>
-): Promise<U[]> {
+async function mapLimit<T, U>(arr: readonly T[], limit: number, iter: (item: T, index: number) => Promise<U>): Promise<U[]> {
   const ret = new Array<U>(arr.length)
   let i = 0
   const workers = new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
@@ -123,12 +122,12 @@ async function mapLimit<T, U>(
   return ret
 }
 
-// --------------------- /person (nomes) ---------------------
+// ---------- /person (nome + cnpj) ----------
 function encodeFilter(obj: unknown) {
   return encodeURIComponent(JSON.stringify(obj))
 }
 
-async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
+async function fetchOwnerInfos(ids: number[]): Promise<Record<number, {name: string|null, cnpj: string|null}>> {
   if (!ids.length) return {}
   const cookie = await getDacSessionCookie()
   const url = new URL(`${DAC_BASE_URL}/person`)
@@ -148,22 +147,24 @@ async function fetchOwnerNames(ids: number[]): Promise<Record<number, string>> {
   })
 
   const payload = await robustJson(res)
-  const out: Record<number, string> = {}
+  const out: Record<number, {name: string|null, cnpj: string|null}> = {}
   if (res.ok && payload?.success && Array.isArray(payload?.data)) {
     for (const p of payload.data) {
       const k = Number(p?.id ?? p?.owner_id)
       const name = p?.name ?? p?.fancy_name ?? null
-      if (k && name) out[k] = String(name)
+      const cnpj = onlyDigits(p?.cnpj ?? null)
+      if (k) out[k] = { name: name ?? null, cnpj: cnpj ?? null }
     }
   }
   return out
 }
 
-// --------------------- persistência no Neon ---------------------
+// ---------- persistência ----------
 type DbRow = {
   id: number
   owner_id: number | null
   owner_name: string | null
+  owner_cnpj: string | null
   invoice_number: string | null
   invoice_status: number | null
   total: string | number | null
@@ -182,6 +183,7 @@ function shapeDbRow(r: any): DbRow {
     id: Number(r.id ?? r.invoice_id ?? r.ID),
     owner_id: r.owner_id != null ? Number(r.owner_id) : (r.owner?.owner_id ?? r.owner?.id ?? null),
     owner_name: r.owner_name ?? r.owner?.name ?? null,
+    owner_cnpj: onlyDigits(r.owner_cnpj ?? r.owner?.cnpj ?? null),
     invoice_number: str(r.invoice_number ?? r.number),
     invoice_status: r.invoice_status != null ? Number(r.invoice_status) : null,
     total: r.total ?? null,
@@ -195,8 +197,18 @@ function shapeDbRow(r: any): DbRow {
   }
 }
 
+let SCHEMA_OK = false
+async function ensureSchema() {
+  if (SCHEMA_OK) return
+  await query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS owner_cnpj TEXT;`)
+  await query(`CREATE INDEX IF NOT EXISTS idx_invoices_owner_cnpj ON invoices(owner_cnpj);`)
+  SCHEMA_OK = true
+}
+
 async function upsertInvoices(rows: any[]): Promise<number> {
   if (!rows.length) return 0
+  await ensureSchema()
+
   let wrote = 0
   await query('BEGIN')
   try {
@@ -205,17 +217,20 @@ async function upsertInvoices(rows: any[]): Promise<number> {
       await query(
         `
         INSERT INTO invoices (
-          id, owner_id, owner_name, invoice_number, invoice_status, total,
+          id, owner_id, owner_name, owner_cnpj,
+          invoice_number, invoice_status, total,
           maturity, payment_form, created_at, invoice_obs,
           cte_id, serie, number, synced_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,
-          $7,$8,$9,$10,
-          $11,$12,$13, NOW()
+          $1,$2,$3,$4,
+          $5,$6,$7,
+          $8,$9,$10,$11,
+          $12,$13,$14, NOW()
         )
         ON CONFLICT (id) DO UPDATE SET
           owner_id = EXCLUDED.owner_id,
           owner_name = EXCLUDED.owner_name,
+          owner_cnpj = EXCLUDED.owner_cnpj,
           invoice_number = EXCLUDED.invoice_number,
           invoice_status = EXCLUDED.invoice_status,
           total = EXCLUDED.total,
@@ -229,7 +244,8 @@ async function upsertInvoices(rows: any[]): Promise<number> {
           synced_at = NOW()
         `,
         [
-          x.id, x.owner_id, x.owner_name, x.invoice_number, x.invoice_status, x.total,
+          x.id, x.owner_id, x.owner_name, x.owner_cnpj,
+          x.invoice_number, x.invoice_status, x.total,
           x.maturity, x.payment_form, x.created_at, x.invoice_obs,
           x.cte_id, x.serie, x.number,
         ]
@@ -244,55 +260,30 @@ async function upsertInvoices(rows: any[]): Promise<number> {
   }
 }
 
-// --------------------- BUSCA no Siimp com divisão por intervalo ---------------------
+// ---------- busca Siimp com divisão (>40) ----------
 let RANGE_CALLS = 0
+const nInt = (v: string | null, def: number) => (v && Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : def)
 
-function nInt(v: string | null, def: number): number {
-  if (!v) return def
-  const n = parseInt(v, 10)
-  return Number.isFinite(n) ? n : def
-}
-
-/**
- * Faz 1 chamada ao Siimp para um intervalo [from..to].
- * Se voltar exatamente 40 (cap), divide o intervalo ao meio e tenta de novo (recursivo).
- */
-async function fetchRangeRecursive(
-  baseQs: URLSearchParams,
-  from: number,
-  to: number,
-  depth = 0
-): Promise<any[]> {
+async function fetchRangeRecursive(baseQs: URLSearchParams, from: number, to: number, depth = 0): Promise<any[]> {
   const qs = new URLSearchParams(baseQs.toString())
   qs.set('number_from', String(from))
   qs.set('number_to', String(to))
-  // OBS: Siimp ignora limit/page/start, então não insistimos aqui
   const path = '/invoices/search' + (qs.toString() ? `?${qs.toString()}` : '')
   const res = await siimp<any>(path, { method: 'GET' })
   RANGE_CALLS++
   const rows = normalizeToArray(res)
 
-  // Se o retorno for <40, está “quebrado” o bastante.
   if (rows.length < 40) return rows
-
-  // Se foi 40 e o range tem mais de 1 número, divide e busca as metades.
   if (from < to && rows.length === 40) {
-    // evita recursão infinita
     if (depth > 20) return rows
     const mid = Math.floor((from + to) / 2)
     const left = await fetchRangeRecursive(baseQs, from, mid, depth + 1)
     const right = await fetchRangeRecursive(baseQs, mid + 1, to, depth + 1)
     return [...left, ...right]
   }
-
   return rows
 }
 
-/**
- * Decide estratégia de busca:
- * - Se vierem number_from/number_to -> usa divisão por intervalo (garante >40).
- * - Caso contrário, faz apenas 1 fetch “simples”.
- */
 async function fetchAllFromSiimp(req: NextRequest): Promise<{ rows: any[], strategy: string }> {
   const baseQs = req.method === 'GET'
     ? new URLSearchParams(req.nextUrl.searchParams)
@@ -313,21 +304,20 @@ async function fetchAllFromSiimp(req: NextRequest): Promise<{ rows: any[], strat
     return { rows, strategy: 'range' }
   }
 
-  // fallback: uma chamada simples (vai trazer até 40)
   const path = '/invoices/search' + (baseQs.toString() ? `?${baseQs.toString()}` : '')
   const res = await siimp<any>(path, { method: 'GET' })
   return { rows: normalizeToArray(res), strategy: 'single' }
 }
 
-// --------------------- CORE ---------------------
+// ---------- CORE ----------
 export async function GET(req: NextRequest) {
   try {
     RANGE_CALLS = 0
 
-    // 1) BUSCA (com divisão por intervalo quando houver number_from/number_to)
+    // 1) BUSCA
     const { rows, strategy } = await fetchAllFromSiimp(req)
 
-    // 2) ENRICH + completar owner_name via /person
+    // 2) ENRICH
     const enriched = await mapLimit(rows, MAX_CONCURRENCY, async (r: any) => {
       const id = r.id ?? r.invoice_id ?? r.ID
       if (!id) {
@@ -335,37 +325,37 @@ export async function GET(req: NextRequest) {
           ...r,
           owner_id:   r.owner_id ?? null,
           owner_name: r.owner_name ?? r?.owner?.name ?? null,
+          owner_cnpj: onlyDigits(r.owner_cnpj ?? r?.owner?.cnpj ?? null),
           cte_id:     r.cte_id   ?? null,
           serie:      r.serie    ?? null,
           number:     r.number   ?? null,
         }
       }
       const s = await fetchDacSlice(id).catch(() => ({
-        owner_id: null, owner_name: null, cte_id: null, serie: null, number: null
+        owner_id: null, owner_name: null, owner_cnpj: null, cte_id: null, serie: null, number: null
       }))
       return {
         ...r,
         owner_id:   r.owner_id   ?? s.owner_id,
         owner_name: r.owner_name ?? r?.owner?.name ?? s.owner_name ?? null,
+        owner_cnpj: onlyDigits(r.owner_cnpj ?? r?.owner?.cnpj) ?? s.owner_cnpj ?? null,
         cte_id:     r.cte_id     ?? s.cte_id,
         serie:      r.serie      ?? s.serie,
         number:     r.number     ?? s.number,
       }
     })
 
-    const missingNameIds = Array.from(
-      new Set(
-        enriched
-          .filter((r: any) => r.owner_id && !r.owner_name)
-          .map((r: any) => Number(r.owner_id))
-      )
-    )
-    if (missingNameIds.length) {
-      const nameMap = await fetchOwnerNames(missingNameIds)
+    // 2b) completar owner_name/owner_cnpj via /person
+    const missingInfoIds = Array.from(new Set(
+      enriched.filter((r: any) => r.owner_id && (!r.owner_name || !r.owner_cnpj)).map((r: any) => Number(r.owner_id))
+    ))
+    if (missingInfoIds.length) {
+      const infoMap = await fetchOwnerInfos(missingInfoIds)
       for (const r of enriched) {
-        if (r.owner_id && !r.owner_name) {
-          const nm = nameMap[Number(r.owner_id)]
-          if (nm) r.owner_name = nm
+        const info = r.owner_id ? infoMap[Number(r.owner_id)] : null
+        if (info) {
+          if (!r.owner_name && info.name) r.owner_name = info.name
+          if (!r.owner_cnpj && info.cnpj) r.owner_cnpj = info.cnpj
         }
       }
     }
@@ -374,12 +364,13 @@ export async function GET(req: NextRequest) {
       ...r,
       owner_id:   r.owner_id   ?? null,
       owner_name: r.owner_name ?? null,
+      owner_cnpj: r.owner_cnpj ?? null,
       cte_id:     r.cte_id     ?? null,
       serie:      r.serie      ?? null,
       number:     r.number     ?? null,
     }))
 
-    // 3) UPSERT no Neon
+    // 3) UPSERT
     const wrote = await upsertInvoices(withKeys)
 
     return NextResponse.json({
@@ -396,6 +387,5 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  // mesmo comportamento do GET (mantém compat)
   return GET(req as unknown as NextRequest)
 }

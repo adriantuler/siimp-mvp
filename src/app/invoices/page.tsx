@@ -5,7 +5,7 @@ import Link from 'next/link'
 
 type Invoice = {
   id: number
-  owner_id?: number | string | null            // ⬅ enriquecido
+  owner_id?: number | string | null
   invoice_number: string
   invoice_status: 0 | 1 | 2 | 3
   total: string
@@ -13,10 +13,9 @@ type Invoice = {
   payment_form: number
   created_at: string
   invoice_obs?: string | null
-  // ⬇ enriquecidos do DAC
   cte_id?: number | string | null
   serie?: string | number | null
-  number?: number | string | null              // documents[0].number
+  number?: number | string | null
 }
 
 const STATUS_MAP: Record<number, string> = {
@@ -29,7 +28,6 @@ const STATUS_MAP: Record<number, string> = {
 function isObj(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null
 }
-
 function toArray<T>(x: unknown): T[] {
   if (Array.isArray(x)) return x as T[]
   if (isObj(x)) return [x as T]
@@ -40,8 +38,9 @@ export default function InvoicesPage() {
   const [rows, setRows] = useState<Invoice[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [meta, setMeta] = useState<{wrote?:number; fetched_total?:number; strategy?:string} | null>(null)
 
-  // filtros simples
+  // filtros
   const [status, setStatus] = useState<string>('0')
   const [numFrom, setNumFrom] = useState<string>('1')
   const [numTo, setNumTo] = useState<string>('1000')
@@ -49,23 +48,26 @@ export default function InvoicesPage() {
   async function fetchData() {
     setLoading(true)
     setError(null)
+    setMeta(null)
     try {
       const qs = new URLSearchParams()
       if (status !== '') qs.set('status', status)
       if (numFrom) qs.set('number_from', numFrom)
       if (numTo) qs.set('number_to', numTo)
 
-      const res = await fetch(`/api/invoices/list?${qs.toString()}`, { cache: 'no-store' })
+      // >>> chama o SEARCH (e não mais /list)
+      const res = await fetch(`/api/invoices/search?${qs.toString()}`, { cache: 'no-store' })
       const json: unknown = await res.json().catch(() => ({}))
 
-      if (!res.ok || (isObj(json) && json.ok === false)) {
+      if (!res.ok || (isObj(json) && (json as any).ok === false)) {
         const msg = isObj(json) && typeof (json as any).error === 'string' ? (json as any).error : 'Falha na busca'
         throw new Error(msg)
       }
 
-      const dataField = isObj(json) ? (json as any).data : undefined
-      const list = toArray<Invoice>(dataField)
+      const j = json as any
+      const list = toArray<Invoice>(j.data)
       setRows(list)
+      setMeta({ wrote: j.wrote, fetched_total: j.fetched_total, strategy: j.strategy })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       setRows([])
@@ -85,7 +87,6 @@ export default function InvoicesPage() {
     return acc
   }, [rows])
 
-  // helper simples para exibir nulos/vazios
   const show = (v: unknown) => (v === null || v === undefined || v === '' ? '' : String(v))
 
   return (
@@ -139,12 +140,20 @@ export default function InvoicesPage() {
 
         <button
           onClick={() => void fetchData()}
-          className="px-3 py-2 rounded bg-blue-600 text-white"
+          className="px-3 py-2 rounded bg-blue-600 text-white disabled:opacity-60"
           disabled={loading}
         >
-          {loading ? 'Buscando...' : 'Buscar'}
+          {loading ? 'Sincronizando…' : 'Buscar'}
         </button>
       </header>
+
+      {meta && (
+        <div className="text-sm text-gray-700">
+          <strong>Sincronizado:</strong> {meta.fetched_total ?? rows.length} itens
+          {typeof meta.wrote === 'number' && <> • <strong>Gravados</strong>: {meta.wrote}</>}
+          {meta.strategy && <> • <strong>Estratégia</strong>: {meta.strategy}</>}
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-800 px-3 py-2 rounded">
@@ -153,7 +162,7 @@ export default function InvoicesPage() {
       )}
 
       <div className="text-sm text-gray-700">
-        <strong>Total:</strong> {rows.length}{' '}
+        <strong>Total exibido:</strong> {rows.length}{' '}
         {Object.keys(totalByStatus).length > 0 && (
           <span className="ml-2">
             • {Object.entries(totalByStatus).map(([k, v]) => `${k}: ${v}`).join(' • ')}
@@ -166,16 +175,16 @@ export default function InvoicesPage() {
           <thead className="bg-gray-100">
             <tr className="[&>th]:px-3 [&>th]:py-2 text-left">
               <th>ID</th>
-              <th>OwnerID</th>             {/* owner_id */}
-              <th>Nº NF</th>             {/* invoice_number */}
+              <th>OwnerID</th>
+              <th>Nº NF</th>
               <th>Status</th>
               <th>Total</th>
               <th>Vencimento</th>
               <th>Forma</th>
               <th>Criada em</th>
-              <th>CT-e ID</th>           {/* cte_id */}
-              <th>Série Doc</th>         {/* serie */}
-              <th>Nº Doc</th>            {/* number (documents[0].number) */}
+              <th>CT-e ID</th>
+              <th>Série Doc</th>
+              <th>Nº Doc</th>
             </tr>
           </thead>
           <tbody>
